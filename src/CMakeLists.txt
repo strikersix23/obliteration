@@ -6,25 +6,19 @@ find_package(Qt6 COMPONENTS Widgets REQUIRED)
 find_package(Threads REQUIRED)
 
 # Setup LLVM target.
-set(LLVM_OPTS -DCMAKE_INSTALL_PREFIX:STRING=<INSTALL_DIR>)
+set(LLVM_OPTS -DCMAKE_INSTALL_PREFIX:STRING=<INSTALL_DIR> -DLLVM_ENABLE_ZSTD:BOOL=OFF -DLLVM_APPEND_VC_REV:BOOL=OFF)
 
 if(WIN32)
     if(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "AMD64")
         list(APPEND LLVM_OPTS -DLLVM_TARGETS_TO_BUILD:STRING=X86)
-        # turn off zstd due to potential shared libray issue
-        list(APPEND LLVM_OPTS -DLLVM_ENABLE_ZSTD:BOOL=OFF)
-
     else()
         message(FATAL_ERROR "Target CPU is not supported")
     endif()
 else()
     if(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "x86_64")
         list(APPEND LLVM_OPTS -DLLVM_TARGETS_TO_BUILD:STRING=X86)
-        list(APPEND LLVM_OPTS -DLLVM_ENABLE_ZSTD:BOOL=OFF)
-
     elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "arm64")
         list(APPEND LLVM_OPTS -DLLVM_TARGETS_TO_BUILD:STRING=AArch64)
-        list(APPEND LLVM_OPTS -DLLVM_ENABLE_ZSTD:BOOL=OFF)
     else()
         message(FATAL_ERROR "Target CPU is not supported")
     endif()
@@ -32,9 +26,14 @@ else()
     list(APPEND LLVM_OPTS -DCMAKE_BUILD_TYPE:STRING=${CMAKE_BUILD_TYPE})
 endif()
 
+# Fix Warning for DOWNLOAD_EXTRACT_TIMESTAMP
+if (CMAKE_VERSION VERSION_GREATER_EQUAL "3.24.0")
+    cmake_policy(SET CMP0135 NEW)
+endif()
+
 ExternalProject_Add(llvm
-    URL https://github.com/llvm/llvm-project/releases/download/llvmorg-16.0.0/llvm-project-16.0.0.src.tar.xz
-    URL_HASH SHA256=9A56D906A2C81F16F06EFC493A646D497C53C2F4F28F0CB1F3C8DA7F74350254
+    URL https://github.com/llvm/llvm-project/releases/download/llvmorg-16.0.6/llvm-project-16.0.6.src.tar.xz
+    URL_HASH SHA256=CE5E71081D17CE9E86D7CBCFA28C4B04B9300F8FB7E78422B1FEB6BC52C3028E
     DOWNLOAD_NO_PROGRESS true
     CMAKE_ARGS -Wno-dev
     CMAKE_CACHE_ARGS ${LLVM_OPTS}
@@ -104,7 +103,7 @@ target_link_libraries(obliteration PRIVATE Threads::Threads)
 target_link_libraries(obliteration PRIVATE ${LIBCORE})
 
 if(WIN32)
-    target_link_libraries(obliteration PRIVATE bcrypt imm32 setupapi userenv version winmm ws2_32)
+    target_link_libraries(obliteration PRIVATE bcrypt imm32 ntdll setupapi userenv version winmm ws2_32)
 else()
     target_link_libraries(obliteration PRIVATE ${CMAKE_DL_LIBS})
 endif()

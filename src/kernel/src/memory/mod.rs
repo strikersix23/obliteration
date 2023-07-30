@@ -1,9 +1,10 @@
 use self::iter::StartFromMut;
 use self::storage::Storage;
-use crate::errno::{EINVAL, ENOMEM};
+use crate::errno::{Errno, EINVAL, ENOMEM};
 use bitflags::bitflags;
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
+use std::num::NonZeroI32;
 use std::ptr::null_mut;
 use std::sync::{Arc, RwLock};
 use thiserror::Error;
@@ -467,6 +468,8 @@ impl MemoryManager {
     }
 }
 
+unsafe impl Sync for MemoryManager {}
+
 /// Contains information for an allocation of virtual pages.
 struct Alloc {
     addr: *mut u8,
@@ -610,8 +613,8 @@ pub enum MmapError {
     NoMem(usize),
 }
 
-impl MmapError {
-    pub fn errno(&self) -> i32 {
+impl Errno for MmapError {
+    fn errno(&self) -> NonZeroI32 {
         match self {
             Self::ZeroLen
             | Self::NoBehavior
@@ -633,8 +636,8 @@ pub enum MunmapError {
     ZeroLen,
 }
 
-impl MunmapError {
-    pub fn errno(&self) -> i32 {
+impl Errno for MunmapError {
+    fn errno(&self) -> NonZeroI32 {
         match self {
             Self::UnalignedAddr | Self::ZeroLen => EINVAL,
         }
@@ -657,8 +660,8 @@ pub enum MprotectError {
     UnmappedAddr(*const u8),
 }
 
-impl MprotectError {
-    pub fn errno(&self) -> i32 {
+impl Errno for MprotectError {
+    fn errno(&self) -> NonZeroI32 {
         match self {
             // On Linux InvalidAddr and UnmappedAddr will be ENOMEM. Let's follow FreeBSD man page
             // until there are some games is expect ENOMEM.

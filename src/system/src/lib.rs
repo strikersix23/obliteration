@@ -1,10 +1,8 @@
-use elf::Elf;
 use error::Error;
-use fs::ModuleInfo;
 use ftp::FtpClient;
 use std::borrow::Cow;
 use std::collections::VecDeque;
-use std::ffi::{c_char, c_void, CString};
+use std::ffi::{c_char, c_void, CStr, CString};
 use std::fs::{create_dir, File};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -29,8 +27,8 @@ pub unsafe extern "C" fn system_download(
     };
 
     // Connect to FTP server.
-    let from = unsafe { util::str::from_c_unchecked(from) };
-    let ftp = match TcpStream::connect(from) {
+    let from = CStr::from_ptr(from);
+    let ftp = match TcpStream::connect(from.to_str().unwrap()) {
         Ok(v) => v,
         Err(e) => return Error::new(&DownloadError::ConnectFailed(e)),
     };
@@ -63,8 +61,8 @@ pub unsafe extern "C" fn system_download(
     }
 
     // Download the whole system directory.
-    let to = Path::new(unsafe { util::str::from_c_unchecked(to) });
-    let mut modules: Vec<ModuleInfo> = Vec::new();
+    let to = CStr::from_ptr(to);
+    let to = Path::new(to.to_str().unwrap());
     let mut dirs = VecDeque::from([(String::from("/system"), to.join("system"))]);
 
     while let Some((remote, local)) = dirs.pop_front() {
@@ -97,25 +95,10 @@ pub unsafe extern "C" fn system_download(
                     if let Err(e) = download_file(&mut ftp, &remote, &local, item.len(), status) {
                         return Error::new(&e);
                     }
-
-                    // Get module info.
-                    match get_module_info(local, remote) {
-                        Ok(v) => {
-                            if let Some(v) = v {
-                                modules.push(v);
-                            }
-                        }
-                        Err(e) => return Error::new(&e),
-                    };
                 }
                 ItemType::Directory => dirs.push_back((remote, local)),
             }
         }
-    }
-
-    // Write module database.
-    if let Err(e) = write_module_db(to.join("modules.yml"), modules) {
-        return Error::new(&e);
     }
 
     null_mut()
@@ -190,69 +173,6 @@ where
     Ok(())
 }
 
-fn get_module_info(local: PathBuf, remote: String) -> Result<Option<ModuleInfo>, DownloadError> {
-    use elf::OpenError;
-
-    // Check file path.
-    if !remote.starts_with("/system/common/lib/") && !remote.starts_with("/system/priv/lib/") {
-        return Ok(None);
-    }
-
-    // Check file name.
-    if let Some(ext) = local.extension() {
-        if ext == "elf" || ext == "self" {
-            return Ok(None);
-        }
-    }
-
-    // Open the file.
-    let file = match File::open(&local) {
-        Ok(v) => v,
-        Err(e) => return Err(DownloadError::OpenFileFailed(local, e)),
-    };
-
-    // Open the SELF.
-    let elf = match Elf::open(local.to_string_lossy(), file) {
-        Ok(v) => v,
-        Err(e) => match e {
-            OpenError::ReadHeaderFailed(i) if i.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Ok(None);
-            }
-            OpenError::InvalidElfMagic => return Ok(None),
-            v => return Err(DownloadError::OpenSelfFailed(local, v)),
-        },
-    };
-
-    // Check if (S)ELF has dynamic linking info.
-    let dynamic = match elf.dynamic_linking() {
-        Some(v) => v,
-        None => return Ok(None),
-    };
-
-    // Store the module information.
-    let info = dynamic.module_info();
-
-    Ok(Some(ModuleInfo {
-        name: info.name().into(),
-        path: remote,
-    }))
-}
-
-fn write_module_db(path: PathBuf, modules: Vec<ModuleInfo>) -> Result<(), DownloadError> {
-    // Open the file.
-    let file = match File::create(&path) {
-        Ok(v) => v,
-        Err(e) => return Err(DownloadError::CreateFileFailed(path, e)),
-    };
-
-    // Write the file.
-    if let Err(e) = serde_yaml::to_writer(file, &modules) {
-        return Err(DownloadError::WriteModuleDbFailed(path, e));
-    }
-
-    Ok(())
-}
-
 #[derive(Debug, Error)]
 pub enum DownloadError {
     #[error("cannot connect to the FTP server")]
@@ -290,13 +210,4 @@ pub enum DownloadError {
 
     #[error("cannot close {0}")]
     CloseRemoteFailed(String, #[source] ftp::retrieve::CloseError),
-
-    #[error("cannot open {0}")]
-    OpenFileFailed(PathBuf, #[source] std::io::Error),
-
-    #[error("cannot open SELF from {0}")]
-    OpenSelfFailed(PathBuf, #[source] elf::OpenError),
-
-    #[error("cannot write a module database to {0}")]
-    WriteModuleDbFailed(PathBuf, #[source] serde_yaml::Error),
 }

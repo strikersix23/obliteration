@@ -43,9 +43,9 @@ MainWindow::MainWindow() :
     restoreGeometry();
 
     // Determine current theme.
-
     QString svgPath;
-    if (QApplication::styleHints()->colorScheme() == Qt::ColorScheme::Dark) {
+
+    if (QGuiApplication::styleHints()->colorScheme() == Qt::ColorScheme::Dark) {
         svgPath = ":/resources/darkmode/";
     } else {
         svgPath = ":/resources/lightmode/";
@@ -212,49 +212,41 @@ void MainWindow::installPkg()
 
     // Open a PKG.
     Pkg pkg;
-    Error newError;
+    Error error;
 
-    pkg = pkg_open(pkgPath.c_str(), &newError);
+    pkg = pkg_open(pkgPath.c_str(), &error);
 
     if (!pkg) {
-        QMessageBox::critical(&progress, "Error", QString("Cannot open %1: %2").arg(pkgPath.c_str()).arg(newError.message()));
+        QMessageBox::critical(&progress, "Error", QString("Cannot open %1: %2").arg(pkgPath.c_str()).arg(error.message()));
         return;
     }
 
     // Get game ID.
-    char *error;
-
-    auto param = pkg_get_param(pkg, &error);
+    Param param(pkg_get_param(pkg, &error));
 
     if (!param) {
-        QMessageBox::critical(&progress, "Error", QString("Failed to get param.sfo from %1: %2").arg(pkgPath.c_str()).arg(error));
-        std::free(error);
+        QMessageBox::critical(&progress, "Error", QString("Failed to get param.sfo from %1: %2").arg(pkgPath.c_str()).arg(error.message()));
         return;
     }
-
-    auto gameId = fromMalloc(pkg_param_title_id(param));
-    auto gameTitle = fromMalloc(pkg_param_title(param));
-
-    pkg_param_close(param);
 
     // Create game directory.
     auto gamesDirectory = readGamesDirectorySetting();
 
-    if (!QDir(gamesDirectory).mkdir(gameId)) {
-        QString msg("Cannot create directory %1 inside %2.");
+    if (!QDir(gamesDirectory).mkdir(param.titleId())) {
+        QString msg(
+            "Cannot create directory %1 inside %2. "
+            "If you have a failed installation from a previous attempt, you will need to remove this directory before trying again.");
 
-        msg += " If you have a failed installation from a previous attempt, you will need to remove this directory before trying again.";
-
-        QMessageBox::critical(&progress, "Error", msg.arg(gameId).arg(gamesDirectory));
+        QMessageBox::critical(&progress, "Error", msg.arg(param.titleId()).arg(gamesDirectory));
         return;
     }
 
-    auto directory = joinPath(gamesDirectory, gameId);
+    auto directory = joinPath(gamesDirectory, param.titleId());
 
     // Extract items.
-    progress.setWindowTitle(gameTitle);
+    progress.setWindowTitle(param.title());
 
-    newError = pkg_extract(pkg, directory.c_str(), [](const char *name, std::uint64_t total, std::uint64_t written, void *ud) {
+    error = pkg_extract(pkg, directory.c_str(), [](const char *name, std::uint64_t total, std::uint64_t written, void *ud) {
         auto toProgress = [total](std::uint64_t v) -> int {
             if (total >= 1024UL*1024UL*1024UL*1024UL) { // >= 1TB
                 return v / (1024UL*1024UL*1024UL*10UL); // 10GB step.
@@ -288,13 +280,13 @@ void MainWindow::installPkg()
     pkg.close();
     progress.complete();
 
-    if (newError) {
-        QMessageBox::critical(this, "Error", QString("Failed to extract %1: %2").arg(pkgPath.c_str()).arg(newError.message()));
+    if (error) {
+        QMessageBox::critical(this, "Error", QString("Failed to extract %1: %2").arg(pkgPath.c_str()).arg(error.message()));
         return;
     }
 
     // Add to game list.
-    auto success = loadGame(gameId);
+    auto success = loadGame(param.titleId());
 
     if (success) {
         QMessageBox::information(this, "Success", "Package installed successfully.");
@@ -303,8 +295,8 @@ void MainWindow::installPkg()
 
 void MainWindow::reportIssue()
 {
-    if (!QDesktopServices::openUrl(QUrl("https://github.com/ultimaweapon/obliteration/issues"))) {
-        QMessageBox::critical(this, "Error", "Failed to open https://github.com/ultimaweapon/obliteration/issues using your browser.");
+    if (!QDesktopServices::openUrl(QUrl("https://github.com/obhq/obliteration/issues"))) {
+        QMessageBox::critical(this, "Error", "Failed to open https://github.com/obhq/obliteration/issues.");
     }
 }
 
@@ -422,7 +414,7 @@ void MainWindow::startGame(const QModelIndex &index)
 
 void MainWindow::kernelError(QProcess::ProcessError error)
 {
-    // Display error.
+    // Get error message.
     QString msg;
 
     switch (error) {
@@ -436,14 +428,15 @@ void MainWindow::kernelError(QProcess::ProcessError error)
         msg = "The kernel encountered an unknown error.";
     }
 
-    QMessageBox::critical(this, "Error", msg);
-
     // Flush the kenel log before we destroy its object.
     kernelOutput();
 
     // Destroy object.
     m_kernel->deleteLater();
     m_kernel = nullptr;
+
+    // Display error.
+    QMessageBox::critical(this, "Error", msg);
 }
 
 void MainWindow::kernelOutput()
@@ -485,30 +478,29 @@ bool MainWindow::loadGame(const QString &gameId)
     // Read game title from param.sfo.
     auto paramDir = joinPath(gamePath.c_str(), "sce_sys");
     auto paramPath = joinPath(paramDir.c_str(), "param.sfo");
-    pkg_param *param;
-    char *error;
-
-    param = pkg_param_open(paramPath.c_str(), &error);
+    Error error;
+    Param param(param_open(paramPath.c_str(), &error));
 
     if (!param) {
-        QMessageBox::critical(this, "Error", QString("Cannot open %1: %2").arg(paramPath.c_str()).arg(error));
-        std::free(error);
+        QMessageBox::critical(this, "Error", QString("Cannot open %1: %2").arg(paramPath.c_str()).arg(error.message()));
         return false;
     }
 
-    auto name = fromMalloc(pkg_param_title(param));
-
-    pkg_param_close(param);
-
     // Add to list.
-    gameList->add(new Game(name, gamePath.c_str()));
+    gameList->add(new Game(param.title(), gamePath.c_str()));
 
     return true;
 }
 
 void MainWindow::killKernel()
 {
-    // We need to disconnect all slots first otherwise the application will be freezing.
+    // Do nothing if the kernel already terminated. This prevent a crash if this method is putting
+    // behind the message box and the kernel itself was terminated while waiting for the user to confirm.
+    if (!m_kernel) {
+        return;
+    }
+
+    // We need to disconnect all slots first otherwise the application will be freeze.
     disconnect(m_kernel, nullptr, nullptr, nullptr);
 
     m_kernel->kill();

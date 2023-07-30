@@ -1,12 +1,12 @@
 use self::entry::Entry;
 use self::header::Header;
 use self::keys::{fake_pfs_key, pkg_key3};
-use self::param::Param;
 use aes::cipher::generic_array::GenericArray;
 use aes::cipher::{BlockDecryptMut, KeyIvInit};
+use param::Param;
 use sha2::Digest;
 use std::error::Error;
-use std::ffi::{c_void, CString};
+use std::ffi::{c_void, CStr, CString};
 use std::fmt::{Display, Formatter};
 use std::fs::{create_dir_all, File};
 use std::io::{Cursor, Read, Write};
@@ -18,15 +18,14 @@ use thiserror::Error;
 pub mod entry;
 pub mod header;
 pub mod keys;
-pub mod param;
 
 #[no_mangle]
 pub unsafe extern "C" fn pkg_open(file: *const c_char, error: *mut *mut error::Error) -> *mut Pkg {
-    let path = unsafe { util::str::from_c_unchecked(file) };
-    let pkg = match Pkg::open(path) {
+    let path = CStr::from_ptr(file);
+    let pkg = match Pkg::open(path.to_str().unwrap()) {
         Ok(v) => Box::new(v),
         Err(e) => {
-            unsafe { *error = error::Error::new(&e) };
+            *error = error::Error::new(&e);
             return null_mut();
         }
     };
@@ -40,11 +39,11 @@ pub unsafe extern "C" fn pkg_close(pkg: *mut Pkg) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pkg_get_param(pkg: &Pkg, error: *mut *mut c_char) -> *mut Param {
+pub unsafe extern "C" fn pkg_get_param(pkg: &Pkg, error: *mut *mut error::Error) -> *mut Param {
     let param = match pkg.get_param() {
         Ok(v) => Box::new(v),
         Err(e) => {
-            unsafe { util::str::set_c(error, &e.to_string()) };
+            *error = error::Error::new(&e);
             return null_mut();
         }
     };
@@ -59,74 +58,12 @@ pub unsafe extern "C" fn pkg_extract(
     status: extern "C" fn(*const c_char, u64, u64, ud: *mut c_void),
     ud: *mut c_void,
 ) -> *mut error::Error {
-    let dir = unsafe { util::str::from_c_unchecked(dir) };
+    let dir = CStr::from_ptr(dir);
 
-    match pkg.extract(dir, status, ud) {
+    match pkg.extract(dir.to_str().unwrap(), status, ud) {
         Ok(_) => null_mut(),
         Err(e) => error::Error::new(&e),
     }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pkg_param_open(
-    file: *const c_char,
-    error: *mut *mut c_char,
-) -> *mut Param {
-    // Open file.
-    let mut file = match File::open(unsafe { util::str::from_c_unchecked(file) }) {
-        Ok(v) => v,
-        Err(e) => {
-            unsafe { util::str::set_c(error, &e.to_string()) };
-            return null_mut();
-        }
-    };
-
-    // param.sfo is quite small so we can read all of it content into memory.
-    let mut data: Vec<u8> = Vec::new();
-
-    match file.metadata() {
-        Ok(v) => {
-            if v.len() <= 4096 {
-                if let Err(e) = file.read_to_end(&mut data) {
-                    unsafe { util::str::set_c(error, &e.to_string()) };
-                    return null_mut();
-                }
-            } else {
-                unsafe { util::str::set_c(error, "file too large") };
-                return null_mut();
-            }
-        }
-        Err(e) => {
-            unsafe { util::str::set_c(error, &e.to_string()) };
-            return null_mut();
-        }
-    };
-
-    // Parse.
-    let param = match Param::read(&data) {
-        Ok(v) => Box::new(v),
-        Err(e) => {
-            unsafe { util::str::set_c(error, &e.to_string()) };
-            return null_mut();
-        }
-    };
-
-    Box::into_raw(param)
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pkg_param_title_id(param: &Param) -> *mut c_char {
-    unsafe { util::str::to_c(param.title_id()) }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pkg_param_title(param: &Param) -> *mut c_char {
-    unsafe { util::str::to_c(param.title()) }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pkg_param_close(param: *mut Param) {
-    unsafe { Box::from_raw(param) };
 }
 
 // https://www.psdevwiki.com/ps4/Package_Files
@@ -178,7 +115,7 @@ impl Pkg {
         };
 
         // Parse data.
-        let param = match Param::read(data) {
+        let param = match Param::read(Cursor::new(data)) {
             Ok(v) => v,
             Err(e) => return Err(GetParamError::ReadFailed(e)),
         };
@@ -560,30 +497,20 @@ impl Pkg {
     where
         O: FnMut([u8; 16]) -> Result<(), E>,
     {
-        if encrypted.len() % 16 != 0 {
-            panic!("The size of encrypted data must be multiply of 16");
-        }
+        assert_eq!(encrypted.len() % 16, 0);
 
         // Setup decryptor.
         let (key, iv) = self.derive_entry_key3(entry);
         let mut decryptor = cbc::Decryptor::<aes::Aes128>::new(&key.into(), &iv.into());
 
         // Dump blocks.
-        loop {
-            let mut block: [u8; 16] = [0u8; 16];
+        while !encrypted.is_empty() {
+            let mut block = [0u8; 16];
 
-            encrypted = match util::array::read_from_slice(&mut block, encrypted) {
-                Some(v) => v,
-                None => break,
-            };
-
+            encrypted.read_exact(&mut block).unwrap();
             decryptor.decrypt_block_mut(GenericArray::from_mut_slice(&mut block));
 
-            let result = output(block);
-
-            if result.is_err() {
-                return result;
-            }
+            output(block)?;
         }
 
         Ok(())
@@ -605,14 +532,9 @@ impl Pkg {
         let secret = sha256.finalize();
 
         // Extract key and IV.
-        let mut key: [u8; 16] = [0u8; 16];
-        let mut iv: [u8; 16] = [0u8; 16];
-        let mut p = secret.as_ptr();
+        let (iv, key) = secret.split_at(16);
 
-        p = unsafe { util::array::read_from_ptr(&mut iv, p) };
-        unsafe { util::array::read_from_ptr(&mut key, p) };
-
-        (key, iv)
+        (key.try_into().unwrap(), iv.try_into().unwrap())
     }
 
     fn load_entry_key3(&mut self) -> Result<(), OpenError> {
@@ -626,20 +548,18 @@ impl Pkg {
         };
 
         // Read seed.
-        let mut seed: [u8; 32] = [0u8; 32];
+        let mut seed = [0u8; 32];
 
-        data = match util::array::read_from_slice(&mut seed, data) {
-            Some(v) => v,
-            None => return Err(OpenError::InvalidEntryOffset(index)),
+        if data.read_exact(&mut seed).is_err() {
+            return Err(OpenError::InvalidEntryOffset(index));
         };
 
         // Read digests.
         let mut digests: [[u8; 32]; 7] = [[0u8; 32]; 7];
 
         for i in 0..7 {
-            data = match util::array::read_from_slice(&mut digests[i], data) {
-                Some(v) => v,
-                None => return Err(OpenError::InvalidEntryOffset(index)),
+            if data.read_exact(&mut digests[i]).is_err() {
+                return Err(OpenError::InvalidEntryOffset(index));
             };
         }
 
@@ -647,9 +567,8 @@ impl Pkg {
         let mut keys: [[u8; 256]; 7] = [[0u8; 256]; 7];
 
         for i in 0..7 {
-            data = match util::array::read_from_slice(&mut keys[i], data) {
-                Some(v) => v,
-                None => return Err(OpenError::InvalidEntryOffset(index)),
+            if data.read_exact(&mut keys[i]).is_err() {
+                return Err(OpenError::InvalidEntryOffset(index));
             };
         }
 

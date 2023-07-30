@@ -7,10 +7,17 @@ members = [
     "ftp",
     "kernel",
     "kernel-macros",
+    "param",
     "pfs",
     "pkg",
     "system",
-    "util"
+    "tls"
 ]
 
 default-members = ["core", "kernel"]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

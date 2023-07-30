@@ -1,79 +1,85 @@
 use super::ExecutionEngine;
-use crate::fs::path::{VPath, VPathBuf};
+use crate::fs::{VPath, VPathBuf};
 use crate::memory::{MprotectError, Protections};
-use crate::module::{Module, ModuleManager, ModuleWorkspace};
-use crate::syscalls::Syscalls;
+use crate::rtld::{Memory, Module, RuntimeLinker};
+use crate::syscalls::{Input, Output, Syscalls};
 use byteorder::{ByteOrder, LE};
-use iced_x86::code_asm::{rax, rbp, rcx, rdi, rdx, rsi, rsp, CodeAssembler};
+use iced_x86::code_asm::{
+    dword_ptr, qword_ptr, r10, r11, r11d, r12, r8, r9, rax, rbp, rbx, rcx, rdi, rdx, rsi, rsp,
+    CodeAssembler,
+};
 use std::error::Error;
-use std::mem::transmute;
+use std::mem::{size_of, transmute};
 use std::ptr::null_mut;
+use std::sync::RwLock;
 use thiserror::Error;
 
 /// An implementation of [`ExecutionEngine`] for running the PS4 binary natively.
 pub struct NativeEngine<'a, 'b: 'a> {
-    modules: &'a ModuleManager<'b>,
-    syscalls: &'a Syscalls,
+    rtld: &'a RwLock<RuntimeLinker<'b>>,
+    syscalls: &'a Syscalls<'a, 'b>,
 }
 
 impl<'a, 'b: 'a> NativeEngine<'a, 'b> {
-    pub fn new(modules: &'a ModuleManager<'b>, syscalls: &'a Syscalls) -> Self {
-        Self { modules, syscalls }
+    pub fn new(rtld: &'a RwLock<RuntimeLinker<'b>>, syscalls: &'a Syscalls<'a, 'b>) -> Self {
+        Self { rtld, syscalls }
     }
 
     /// # SAFETY
     /// No other threads may read or write any module memory.
     pub unsafe fn patch_mods(&mut self) -> Result<Vec<(VPathBuf, usize)>, PatchModsError> {
+        let ld = self.rtld.read().unwrap();
         let mut counts: Vec<(VPathBuf, usize)> = Vec::new();
 
-        self.modules.for_each(|module| {
+        for module in ld.list() {
             let count = self.patch_mod(module)?;
-            let path: VPathBuf = module.image().name().try_into().unwrap();
+            let path = module.path();
 
-            counts.push((path, count));
-            Ok(())
-        })?;
+            counts.push((path.to_owned(), count));
+        }
 
         Ok(counts)
     }
 
-    fn syscalls(&self) -> *const Syscalls {
+    fn syscalls(&self) -> *const Syscalls<'a, 'b> {
         self.syscalls
     }
 
-    fn patch_mod(&self, module: &Module) -> Result<usize, PatchModsError> {
-        let path: VPathBuf = module.image().name().try_into().unwrap();
-
-        // Get the module memory.
-        let mut mem = match unsafe { module.memory().unprotect() } {
-            Ok(v) => v,
-            Err(e) => return Err(PatchModsError::UnprotectMemoryFailed(path, e)),
-        };
+    /// # Safety
+    /// No other threads may access the memory of `module`.
+    unsafe fn patch_mod(&self, module: &Module) -> Result<usize, PatchModsError> {
+        let path = module.path();
 
         // Patch all executable sections.
+        let mem = module.memory();
         let base = mem.addr();
         let mut count = 0;
 
-        for seg in module.memory().segments() {
-            if !seg.prot().contains(Protections::CPU_EXEC) {
+        for (i, seg) in mem.segments().iter().enumerate() {
+            if seg.program().is_none() || !seg.prot().contains(Protections::CPU_EXEC) {
                 continue;
             }
 
-            // Patch segment.
-            let start = seg.start();
-            let mem = &mut mem[start..(start + seg.len())];
+            // Unprotect the segment.
+            let mut seg = match mem.unprotect_segment(i) {
+                Ok(v) => v,
+                Err(e) => return Err(PatchModsError::UnprotectMemoryFailed(path.to_owned(), e)),
+            };
 
-            count += self.patch_segment(&path, base, module.memory().workspace(), mem)?;
+            // Patch segment.
+            count += self.patch_segment(path, base, mem, seg.as_mut())?;
         }
 
         Ok(count)
     }
 
-    fn patch_segment(
+    /// # Safety
+    /// No other threads may execute the memory in the code workspace on `mem`.
+    unsafe fn patch_segment(
         &self,
         module: &VPath,
         base: usize,
-        wp: &ModuleWorkspace,
+        mem: &Memory,
         seg: &mut [u8],
     ) -> Result<usize, PatchModsError> {
         let addr = seg.as_ptr() as usize;
@@ -82,19 +88,19 @@ impl<'a, 'b: 'a> NativeEngine<'a, 'b> {
         let mut i = 0;
 
         while i < seg.len() {
-            let mem = &mut seg[i..];
+            let target = &mut seg[i..];
             let offset = offset + i;
             let addr = addr + i;
-            let res = if mem.starts_with(&[0x48, 0xc7, 0xc0]) {
+            let res = if target.starts_with(&[0x48, 0xc7, 0xc0]) {
                 // Possible of:
                 // mov rax, imm32
                 // mov r10, rcx
                 // syscall
-                self.patch_syscall(module, wp, mem, offset, addr)?
-            } else if mem.starts_with(&[0xcd, 0x44, 0xba, 0xcc, 0xcc, 0xcc, 0xcc]) {
+                self.patch_syscall(module, mem, target, offset, addr)?
+            } else if target.starts_with(&[0xcd, 0x44, 0xba, 0xcc, 0xcc, 0xcc, 0xcc]) {
                 // int 0x44
                 // mov edx, 0xcccccccc
-                self.patch_int44(module, wp, mem, offset, addr)?
+                self.patch_int44(module, mem, target, offset, addr)?
             } else {
                 None
             };
@@ -111,30 +117,32 @@ impl<'a, 'b: 'a> NativeEngine<'a, 'b> {
         Ok(count)
     }
 
-    fn patch_syscall(
+    /// # Safety
+    /// No other threads may execute the memory in the code workspace on `mem`.
+    unsafe fn patch_syscall(
         &self,
         module: &VPath,
-        wp: &ModuleWorkspace,
-        mem: &mut [u8],
+        mem: &Memory,
+        target: &mut [u8],
         offset: usize,
         addr: usize,
     ) -> Result<Option<usize>, PatchModsError> {
         // Check if "mov rax, imm32".
-        if mem.len() < 7 {
+        if target.len() < 7 {
             return Ok(None);
         }
 
         // Check if next instructions are:
         // mov r10, rcx
         // syscall
-        if !mem[7..].starts_with(&[0x49, 0x89, 0xca, 0x0f, 0x05]) {
+        if !target[7..].starts_with(&[0x49, 0x89, 0xca, 0x0f, 0x05]) {
             return Ok(None);
         }
 
         // Build trampoline.
-        let id = LE::read_u32(&mem[3..]);
+        let id = LE::read_u32(&target[3..]);
         let ret = addr + 7 + 5;
-        let tp = match self.build_syscall_trampoline(wp, module, offset + 10, id, ret) {
+        let tp = match self.build_syscall_trampoline(mem, module, offset + 10, id, ret) {
             Ok(v) => v,
             Err(e) => {
                 return Err(PatchModsError::BuildTrampolineFailed(
@@ -151,35 +159,37 @@ impl<'a, 'b: 'a> NativeEngine<'a, 'b> {
             None => return Err(PatchModsError::WorkspaceTooFar(module.to_owned())),
         };
 
-        mem[0] = 0xe9;
-        mem[1] = tp[0];
-        mem[2] = tp[1];
-        mem[3] = tp[2];
-        mem[4] = tp[3];
-        mem[5] = 0xcc;
-        mem[6] = 0xcc;
+        target[0] = 0xe9;
+        target[1] = tp[0];
+        target[2] = tp[1];
+        target[3] = tp[2];
+        target[4] = tp[3];
+        target[5] = 0xcc;
+        target[6] = 0xcc;
 
         // Patch "mov r10, rcx" and "syscall" with "int3" to catch unknown jump.
-        mem[7] = 0xcc;
-        mem[8] = 0xcc;
-        mem[9] = 0xcc;
-        mem[10] = 0xcc;
-        mem[11] = 0xcc;
+        target[7] = 0xcc;
+        target[8] = 0xcc;
+        target[9] = 0xcc;
+        target[10] = 0xcc;
+        target[11] = 0xcc;
 
         Ok(Some(7 + 5))
     }
 
-    fn patch_int44(
+    /// # Safety
+    /// No other threads may execute the memory in the code workspace on `mem`.
+    unsafe fn patch_int44(
         &self,
         module: &VPath,
-        wp: &ModuleWorkspace,
-        mem: &mut [u8],
+        mem: &Memory,
+        target: &mut [u8],
         offset: usize,
         addr: usize,
     ) -> Result<Option<usize>, PatchModsError> {
         // Build trampoline.
         let ret = addr + 2 + 5;
-        let tp = match self.build_int44_trampoline(wp, module, offset, ret) {
+        let tp = match self.build_int44_trampoline(mem, module, offset, ret) {
             Ok(v) => v,
             Err(e) => {
                 return Err(PatchModsError::BuildTrampolineFailed(
@@ -191,8 +201,8 @@ impl<'a, 'b: 'a> NativeEngine<'a, 'b> {
         };
 
         // Patch "int 0x44" with "nop".
-        mem[0] = 0x90;
-        mem[1] = 0x90;
+        target[0] = 0x90;
+        target[1] = 0x90;
 
         // Patch "mov edx, 0xcccccccc" with "jmp rel32".
         let tp = match Self::get_relative_offset(addr + 7, tp) {
@@ -200,18 +210,20 @@ impl<'a, 'b: 'a> NativeEngine<'a, 'b> {
             None => return Err(PatchModsError::WorkspaceTooFar(module.to_owned())),
         };
 
-        mem[2] = 0xe9;
-        mem[3] = tp[0];
-        mem[4] = tp[1];
-        mem[5] = tp[2];
-        mem[6] = tp[3];
+        target[2] = 0xe9;
+        target[3] = tp[0];
+        target[4] = tp[1];
+        target[5] = tp[2];
+        target[6] = tp[3];
 
         Ok(Some(7))
     }
 
-    fn build_syscall_trampoline(
+    /// # Safety
+    /// No other threads may execute the memory in the code workspace on `mem`.
+    unsafe fn build_syscall_trampoline(
         &self,
-        wp: &ModuleWorkspace,
+        mem: &Memory,
         module: &VPath,
         offset: usize,
         id: u32,
@@ -219,33 +231,103 @@ impl<'a, 'b: 'a> NativeEngine<'a, 'b> {
     ) -> Result<usize, TrampolineError> {
         let mut asm = CodeAssembler::new(64).unwrap();
 
-        // Create stack frame.
+        assert_eq!(72, size_of::<Input>());
+        assert_eq!(16, size_of::<Output>());
+
+        // Create function prologue.
         asm.push(rbp).unwrap();
         asm.mov(rbp, rsp).unwrap();
+
+        // Clear CF and save rFLAGS.
+        asm.clc().unwrap();
+        asm.pushfq().unwrap();
+        asm.pop(r11).unwrap();
         asm.and(rsp, !15).unwrap(); // Make sure stack is align to 16 bytes boundary.
 
-        // Invoke our routine.
-        let module = match wp.push(module.to_owned()) {
+        // Create stack frame.
+        asm.sub(rsp, 0x50 + 0x10).unwrap();
+        asm.mov(rax, rsp).unwrap();
+
+        // Save registers.
+        asm.push(rdi).unwrap();
+        asm.push(rsi).unwrap();
+        asm.push(rbx).unwrap();
+        asm.push(r12).unwrap();
+        asm.push(rdx).unwrap();
+        asm.push(r11).unwrap();
+
+        // Setup input.
+        let module = match mem.push_data(module.to_owned()) {
             Some(v) => v,
             None => return Err(TrampolineError::SpaceNotEnough),
         };
 
-        asm.mov(rcx, module as u64).unwrap();
-        asm.mov(rdx, offset as u64).unwrap();
-        asm.mov(rsi, id as u64).unwrap();
+        asm.mov(rbx, rax).unwrap();
+        asm.mov(dword_ptr(rbx), id).unwrap();
+        asm.mov(rax, offset as u64).unwrap();
+        asm.mov(qword_ptr(rbx + 0x08), rax).unwrap();
+        asm.mov(rax, module as u64).unwrap();
+        asm.mov(qword_ptr(rbx + 0x10), rax).unwrap();
+        asm.mov(qword_ptr(rbx + 0x18), rdi).unwrap();
+        asm.mov(qword_ptr(rbx + 0x20), rsi).unwrap();
+        asm.mov(qword_ptr(rbx + 0x28), rdx).unwrap();
+        asm.mov(qword_ptr(rbx + 0x30), rcx).unwrap();
+        asm.mov(qword_ptr(rbx + 0x38), r8).unwrap();
+        asm.mov(qword_ptr(rbx + 0x40), r9).unwrap();
+
+        // Invoke our routine.
+        asm.mov(rax, rbx).unwrap();
+        asm.add(rax, 0x50).unwrap();
+        asm.mov(rdx, rax).unwrap();
+        asm.mov(rsi, rbx).unwrap();
         asm.mov(rdi, self.syscalls() as u64).unwrap();
-        asm.mov(rax, Syscalls::unimplemented as u64).unwrap();
+        asm.mov(rax, Syscalls::invoke as u64).unwrap();
         asm.call(rax).unwrap();
 
+        // Check error. This mimic the behavior of
+        // https://github.com/freebsd/freebsd-src/blob/release/9.1.0/sys/amd64/amd64/vm_machdep.c#L380.
+        let mut err = asm.create_label();
+        let mut restore = asm.create_label();
+
+        asm.pop(r11).unwrap();
+        asm.pop(rdx).unwrap();
+        asm.test(rax, rax).unwrap();
+        asm.jnz(err).unwrap();
+
+        // Set output.
+        asm.mov(rax, qword_ptr(rbx + 0x50)).unwrap();
+        asm.mov(rdx, qword_ptr(rbx + 0x58)).unwrap();
+        asm.jmp(restore).unwrap();
+
+        // Set CF.
+        asm.set_label(&mut err).unwrap();
+        asm.or(r11, 1).unwrap();
+
         // Restore registers.
+        asm.set_label(&mut restore).unwrap();
+        asm.pop(r12).unwrap();
+        asm.pop(rbx).unwrap();
+        asm.pop(rsi).unwrap();
+        asm.pop(rdi).unwrap();
+        asm.mov(rcx, ret as u64).unwrap();
+        asm.xor(r8, r8).unwrap();
+        asm.xor(r9, r9).unwrap();
+        asm.xor(r10, r10).unwrap();
+
+        // Restore rFLAGS.
+        asm.mov(r11d, r11d).unwrap(); // Clear the upper dword.
+        asm.push(r11).unwrap();
+        asm.popfq().unwrap();
         asm.leave().unwrap();
 
-        self.write_trampoline(wp, ret, asm)
+        self.write_trampoline(mem, ret, asm)
     }
 
-    fn build_int44_trampoline(
+    /// # Safety
+    /// No other threads may execute the memory in the code workspace on `mem`.
+    unsafe fn build_int44_trampoline(
         &self,
-        wp: &ModuleWorkspace,
+        mem: &Memory,
         module: &VPath,
         offset: usize,
         ret: usize,
@@ -262,7 +344,7 @@ impl<'a, 'b: 'a> NativeEngine<'a, 'b> {
         asm.push(rsi).unwrap();
 
         // Invoke our routine.
-        let module = match wp.push(module.to_owned()) {
+        let module = match mem.push_data(module.to_owned()) {
             Some(v) => v,
             None => return Err(TrampolineError::SpaceNotEnough),
         };
@@ -280,16 +362,22 @@ impl<'a, 'b: 'a> NativeEngine<'a, 'b> {
         asm.pop(rdi).unwrap();
         asm.leave().unwrap();
 
-        self.write_trampoline(wp, ret, asm)
+        self.write_trampoline(mem, ret, asm)
     }
 
-    fn write_trampoline(
+    /// # Safety
+    /// No other threads may execute the memory in the code workspace on `mem`.
+    unsafe fn write_trampoline(
         &self,
-        wp: &ModuleWorkspace,
+        mem: &Memory,
         ret: usize,
         mut assembled: CodeAssembler,
     ) -> Result<usize, TrampolineError> {
-        let mut mem = wp.memory();
+        // Get workspace.
+        let mut mem = match mem.code_workspace() {
+            Ok(v) => v,
+            Err(e) => return Err(TrampolineError::UnprotectWorkspaceFailed(e)),
+        };
 
         // Align base address to 16 byte boundary for performance.
         let base = mem.addr();
@@ -322,7 +410,7 @@ impl<'a, 'b: 'a> NativeEngine<'a, 'b> {
         });
 
         // Write the assembled code.
-        let output = match mem.as_mut_slice().get_mut(offset..) {
+        let output = match mem.as_mut().get_mut(offset..) {
             Some(v) => v,
             None => return Err(TrampolineError::SpaceNotEnough),
         };
@@ -352,17 +440,22 @@ impl<'a, 'b: 'a> NativeEngine<'a, 'b> {
 
 impl<'a, 'b> ExecutionEngine for NativeEngine<'a, 'b> {
     fn run(&mut self) -> Result<(), Box<dyn Error>> {
+        // Get eboot.bin.
+        let ld = self.rtld.read().unwrap();
+        let eboot = ld.app();
+
+        if eboot.file_info().is_none() {
+            todo!("a statically linked eboot.bin is not supported yet");
+        }
+
         // Get boot module.
-        let path: &VPath = "/system/common/lib/libkernel.sprx".try_into().unwrap();
-        let boot = match self.modules.get_mod(path) {
-            Some(v) => v,
-            None => self.modules.get_eboot(),
-        };
+        let boot = ld.kernel().unwrap();
 
         // Get entry point.
         let mem = boot.memory().as_ref();
-        let entry: EntryPoint =
-            unsafe { transmute(mem[boot.image().entry_addr().unwrap()..].as_ptr()) };
+        let entry: EntryPoint = unsafe { transmute(mem[boot.entry().unwrap()..].as_ptr()) };
+
+        drop(ld);
 
         // TODO: Check how the actual binary read its argument.
         // Setup arguments.
@@ -408,6 +501,9 @@ pub enum PatchModsError {
 /// Errors for trampoline building.
 #[derive(Debug, Error)]
 pub enum TrampolineError {
+    #[error("cannot unprotect code workspace")]
+    UnprotectWorkspaceFailed(#[source] MprotectError),
+
     #[error("the remaining workspace is not enough")]
     SpaceNotEnough,
 

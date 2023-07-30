@@ -1,7 +1,7 @@
 <p align="center"><img alt="Logo" src="logo.png"></p>
 
 ## About
-[![CI](https://github.com/obhq/obliteration/actions/workflows/main.yml/badge.svg)](https://github.com/obhq/obliteration/actions/workflows/main.yml) [![Matrix](https://img.shields.io/matrix/obliteration:matrix.org?color=740d03&label=Obliteration&logo=matrix)](https://matrix.to/#/#obliteration:matrix.org)
+[![CI](https://github.com/obhq/obliteration/actions/workflows/main.yml/badge.svg)](https://github.com/obhq/obliteration/actions/workflows/main.yml) [![Discord](https://img.shields.io/discord/1121284256816185444?color=740d03&label=Obliteration&logo=discord)](https://discord.gg/Qsdaxj6tnH)
 
 Obliteration is an experimental PS4 emulator using [Kyty](https://github.com/InoriRus/Kyty) and [Uplift](https://github.com/idc/uplift) as a reference. The project is under development and cannot run any games that Kyty is able to run yet.
 
@@ -15,11 +15,11 @@ You can download binaries from the latest commits [here](https://github.com/obhq
 
 ![Game list](screenshots/game-list.png)
 
-Thanks [Mou-Ikkai](https://github.com/Mou-Ikkai) for the awesome icon!
+Thanks to [VocalFan](https://github.com/VocalFan) for the awesome icon!
 
 ## Obliteration discussion
 
-We have a Matrix Room Space `#obliteration:matrix.org` on [Matrix.to](https://matrix.to/#/#obliteration:matrix.org) to discuss the project. Read each room's Topic for more information.
+We have a Discord server for discussion about Obliteration and its development. You can join the server [here](https://discord.gg/Qsdaxj6tnH).
 
 ## Features
 
@@ -32,9 +32,9 @@ We have a Matrix Room Space `#obliteration:matrix.org` on [Matrix.to](https://ma
 
 ## System requirements
 
-- Windows 10, Linux and macOS.
-- x86-64 or AArch64 CPU.
-- A jailbroken PS4 with FTP server that support SELF decryption.
+- Windows 10, Linux or macOS.
+- x86-64 CPU.
+- A jailbroken PS4 with FTP server that supports SELF decryption.
 
 ### Windows-specific requirements
 
@@ -113,7 +113,7 @@ If all you want is to use the emulator, choose `[YOUR-PLATFORM]-release` for opt
 cmake --build build
 ```
 
-You can use `-j` to enable parallel building (e.g. `cmake --build build -j 2`). Each parallel build consumes a lot of memory so don't use the number of your CPU cores otherwise your system might crash due to out of memory.
+You can use `-j` to enable parallel building (e.g. `cmake --build build -j 2`). Each parallel build on Linux consumes a lot of memory so don't use the number of your CPU cores otherwise your system might crash due to out of memory. On Windows it seems like it is safe to use the number of your CPU cores.
 
 ## Development
 
@@ -146,24 +146,34 @@ Just follow how Qt is written (e.g. coding style, etc.). Always prefers Qt class
 The application consists of 2 binaries:
 
 1. Main application. This is what users will see when they launch Obliteration. Its entry point is inside `src/main.cpp`.
-2. Emulator kernel. This is where PS4 emulation takes place. Its entry point is inside `src/kernel/src/main.rs`.
+2. Emulator kernel. This is where emulation takes place. Its entry point is inside `src/kernel/src/main.rs`.
 
 ### Debugging the kernel
 
 Create `.kernel-debug` in the root of the repository. The contents of this file is YAML and the kernel will deserialize it to the `Args` struct in `src/kernel/src/main.rs` when passing the `--debug` flag to the kernel.
+
 - game: (Folder Path) | Where is the game to load?
 - system: (Folder Path) | Where is the system firmware?
 - debug-dump: (Folder Path) | Where should the debug log be saved?
 - clear-debug-dump: (boolean) | Should we remove the old debug log?
+
 We already provide a launch configuration for VS Code so all you need to do is choose `Kernel` as the configuration and start debugging.
 
 ### UI Icons
 
 We use icons from https://materialdesignicons.com for UI (e.g. on the menu and toolbar).
 
+### Additional informations
+
+[PS4 Developer Wiki](https://www.psdevwiki.com/ps4) has a lot of useful information about the PS4 internal. We also have a PS4 reverse engineering [project](https://github.com/obhq/reverse-engineering).
+
+## Code contribution
+
+If you want to make some contributions but don't know what to work on you can look for `TODO` comment or `todo!` macro invocation in the source code. You can also take a look on the unassigned issues.
+
 ## License
 
 - `src/ansi_escape.hpp`, `src/ansi_escape.cpp`, `src/log_formatter.hpp` and `src/log_formatter.cpp` are licensed under GPL-3.0 only.
-- `src/pfs` and `src/pkg` are licensed under LGPL-3.0 license.
+- `src/param`, `src/pfs` and `src/pkg` are licensed under LGPL-3.0 license.
 - All other source code is licensed under MIT license.
 - All release binaries are under GPL-3.0 license.
